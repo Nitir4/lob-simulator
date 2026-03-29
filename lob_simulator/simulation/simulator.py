@@ -1,37 +1,14 @@
-"""
-simulation/simulator.py  (PHASE 2-5 REVISION)
-===============================================
-Changes in this revision:
+"""Event-driven matching, independent cancellation lifetimes and diagnostics.
 
-1. O(1) new-order tracking  [Phase 2, Flaw 5 fix]
-   BEFORE: set(order_book._order_index.keys()) before/after → O(n) per event.
-   AFTER:  add_limit_order() returns (trades, rested_order).
-           We use the returned Optional[Order] directly to schedule cancel.
-           No set difference, no O(n) copy.
-
-2. State passed to EventGenerator via update_state()  [Phase 3]
-   After each event: pass mid-price AND imbalance to generator.
-   Generator then uses imbalance to modulate market order probabilities.
-
-3. Volume and imbalance logged in snapshots  [Phase 4]
-   Each snapshot now includes:
-     imbalance    : I ∈ [-1, 1]
-     bid_volume   : Total volume at best bid level
-     ask_volume   : Total volume at best ask level
-     n_resting    : Total number of resting orders (stationarity monitor)
-   This gives the user data to verify stationarity and study book dynamics.
-
-4. Stationarity monitor in summary()  [Phase 1, Flaw 6 fix]
-   Reports peak_resting and mean_resting across the simulation.
-   If peak > 1000, prints a warning (book may be growing unboundedly).
-
-5. Backward compatibility: Simulator still accepts SimParams; warmup
-   uses exponential placement which may cross → handled by add_limit_order.
+The constant-rate arrival clock is sampled separately from state-dependent
+marks so preceding cancellations update the state first. Queue means distinguish
+event sampling from time weighting; neither alone proves stationarity.
 """
 
 from __future__ import annotations
 
 import heapq
+import math
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
@@ -59,6 +36,27 @@ class SimulationHistory:
     trades:    List[Trade]          = field(default_factory=list)
     params:    Optional[SimParams]  = None
     duration:  float                = 0.0
+    initial_snapshot: Optional[Dict[str, Any]] = None
+
+    def time_average_resting(self) -> Optional[float]:
+        """Integrate the piecewise-constant queue depth, including the final tail.
+
+        None means no positive horizon or no captured initial state (e.g. an
+        old/manually constructed history); it must not be replaced by event mean.
+        """
+        if self.duration <= 0 or self.initial_snapshot is None:
+            return None
+        previous_time = 0.0
+        previous_depth = self.initial_snapshot['n_resting']
+        integral = 0.0
+        for snapshot in self.snapshots:
+            t = snapshot['time']
+            if not math.isfinite(t) or not previous_time <= t <= self.duration:
+                raise ValueError('Snapshots must be chronological within the horizon.')
+            integral += previous_depth*(t-previous_time)
+            previous_time, previous_depth = t, snapshot['n_resting']
+        integral += previous_depth*(self.duration-previous_time)
+        return integral/self.duration
 
     def to_dataframe(self):
         try:
@@ -73,10 +71,14 @@ class SimulationHistory:
         mids = [s["mid_price"] for s in self.snapshots if s["mid_price"] is not None]
         resting_counts = [s["n_resting"] for s in self.snapshots]
 
-        # Stationarity check
-        peak_resting = max(resting_counts) if resting_counts else 0
+        # Descriptive queue diagnostics, not a stationarity test.
+        peak_resting = max(resting_counts+[self.initial_snapshot['n_resting']] if self.initial_snapshot else resting_counts, default=0)
         mean_resting = (sum(resting_counts) / len(resting_counts)
-                        if resting_counts else 0)
+                        if resting_counts else None)
+        time_mean = self.time_average_resting()
+        initial_mid = self.initial_snapshot.get('mid_price') if self.initial_snapshot else None
+        start_mid = initial_mid if initial_mid is not None else (mids[0] if mids else None)
+        end_mid = mids[-1] if mids else initial_mid
 
         lines = [
             "── Simulation Summary ──────────────────────────",
@@ -84,15 +86,16 @@ class SimulationHistory:
             f"  Arrivals      : {n_arrive}",
             f"  Cancellations : {n_cancel}",
             f"  Trades        : {len(self.trades)}",
-            f"  Mid (start)   : {mids[0]:.4f}" if mids else "  Mid : N/A",
-            f"  Mid (end)     : {mids[-1]:.4f}" if mids else "",
-            f"  Mid drift     : {mids[-1]-mids[0]:+.4f}" if len(mids) > 1 else "",
+            f"  Mid (start)   : {start_mid:.4f}" if start_mid is not None else "  Mid : N/A",
+            f"  Mid (end)     : {end_mid:.4f}" if end_mid is not None else "",
+            f"  Mid drift     : {end_mid-start_mid:+.4f}" if start_mid is not None and end_mid is not None else "",
             f"  Peak resting  : {peak_resting}",
-            f"  Mean resting  : {mean_resting:.1f}",
+            f"  Mean resting (event): {mean_resting:.1f}" if mean_resting is not None else "  Mean resting (event): unavailable",
+            f"  Mean resting (time) : {time_mean:.3f}" if time_mean is not None else "  Mean resting (time) : unavailable",
         ]
         if peak_resting > 1000:
-            lines.append("  ⚠ WARNING: peak_resting > 1000 — book may not be stationary.")
-            lines.append("    Increase mu_cancel or reduce arrival_rate.")
+            lines.append("  ⚠ Peak resting > 1000; inspect arrivals, fills and cancellations.")
+            lines.append("    A count threshold is not a stationarity test.")
         lines.append("────────────────────────────────────────────────")
         return "\n".join(lines)
 
@@ -107,7 +110,7 @@ class Simulator:
       + Positive bid-ask spread with genuine tightening/widening dynamics.
       + Price-time priority (maker pricing rule).
       + Inside-spread limit orders from mid-anchored Exp placement.
-      + State-dependent market order rates (queue imbalance → directional drift).
+      + State-dependent event-type probabilities at a constant total arrival rate.
       + Poisson arrivals + Exponential order lifetimes (cancellations).
       + Right-skewed order sizes (Geometric).
 
@@ -155,50 +158,52 @@ class Simulator:
            e. Update generator state: mid + imbalance.
            f. Log snapshot with imbalance, volumes, n_resting.
         """
+        if not math.isfinite(T) or T < 0:
+            raise ValueError('Simulation horizon must be finite and nonnegative.')
         self._reset()
         self.history.duration = T
-
         self._warmup_book()
-
         t = 0.0
-
         while True:
-            # 2a. Draw next arrival
-            event = self.event_generator.next_event(current_time=t)
-            if event.arrival_time > T:
-                self._process_cancellations_before(T)
+            result = self.advance(t, horizon=T)
+            if result is None:
                 break
-
-            # 2b. Process cancellations due before this arrival
-            self._process_cancellations_before(event.arrival_time)
-
-            t = event.arrival_time
-
-            # 2c. Submit order to LOB
-            order = self._event_to_order(event)
-
-            if order.order_type == "limit":
-                trades, rested = self.order_book.add_limit_order(order)
-            else:
-                trades = self.order_book.process_market_order(order)
-                rested = None   # market orders never rest
-
-            # 2d. Schedule cancel for newly rested order — O(1)
-            if rested is not None:
-                cancel_time = self.event_generator.generate_cancel_time(t)
-                self._schedule_cancel(rested.order_id, cancel_time)
-
-            # 2e. Update event generator state
-            mid       = self.order_book.get_mid_price()
-            imbalance = self.order_book.get_imbalance()
-            self.event_generator.update_state(mid=mid, imbalance=imbalance)
-
-            # 2f. Log snapshot
-            snap = self._build_snapshot(t, event.event_type.name, trades)
-            self.history.snapshots.append(snap)
-            self.history.trades.extend(trades)
+            t = result[0].arrival_time
 
         return self.history
+
+    def advance(self, current_time: float, horizon: float | None = None):
+        """Process cancellations, then one arrival, shared by batch and GUI.
+
+        Returns (event, submitted_order, trades), or None at the horizon.
+        Cancellation wins a timestamp tie. Arrival intensity is constant;
+        its state-dependent type, price and size are sampled at arrival.
+        """
+        arrival_time = self.event_generator.next_arrival_time(current_time)
+        cutoff = arrival_time if horizon is None else min(arrival_time, horizon)
+        self._process_cancellations_before(cutoff)
+        if horizon is not None and arrival_time > horizon:
+            return None
+        event = self.event_generator.event_at(arrival_time)
+        order = self._event_to_order(event)
+        if order.order_type == 'limit':
+            trades, rested = self.order_book.add_limit_order(order)
+        else:
+            trades, rested = self.order_book.process_market_order(order), None
+        if rested is not None:
+            self._schedule_cancel(rested.order_id, self.event_generator.generate_cancel_time(arrival_time))
+        for trade in trades:
+            for order_id in (trade.buy_order_id, trade.sell_order_id):
+                if order_id not in self.order_book._order_index:
+                    self._update_generator_state()
+        self._update_generator_state()
+        self.history.snapshots.append(self._build_snapshot(arrival_time, event.event_type.name, trades))
+        self.history.trades.extend(trades)
+        return event, order, trades
+
+    def _update_generator_state(self):
+        self.event_generator.update_state(mid=self.order_book.get_mid_price(),
+                                          imbalance=self.order_book.get_imbalance())
 
     # ── Private helpers ────────────────────────────────────────────────
 
@@ -213,10 +218,10 @@ class Simulator:
         half_spread = p.initial_spread / 2
 
         for i in range(1, 4):
-            bid_px = round(
+            bid_px = math.floor(
                 (mid - half_spread - (i - 1) * p.tick_size) / p.tick_size
             ) * p.tick_size
-            ask_px = round(
+            ask_px = math.ceil(
                 (mid + half_spread + (i - 1) * p.tick_size) / p.tick_size
             ) * p.tick_size
             qty = 5 + i * 2
@@ -236,6 +241,7 @@ class Simulator:
             mid=self.order_book.get_mid_price(),
             imbalance=self.order_book.get_imbalance(),
         )
+        self.history.initial_snapshot = self._build_snapshot(0.0, 'INITIAL', [])
 
     def _schedule_cancel(self, order_id: int, cancel_time: float) -> None:
         heapq.heappush(self._cancel_heap, (cancel_time, order_id))
@@ -249,9 +255,10 @@ class Simulator:
         while self._cancel_heap and self._cancel_heap[0][0] <= t_cutoff:
             cancel_time, order_id = heapq.heappop(self._cancel_heap)
 
+            self._pending_cancels.pop(order_id, None)
             if order_id in self.order_book._order_index:
                 if self.order_book.cancel_order(order_id):
-                    self._pending_cancels.pop(order_id, None)
+                    self._update_generator_state()
                     snap = self._build_snapshot(cancel_time, "CANCEL", [])
                     self.history.snapshots.append(snap)
 
@@ -271,7 +278,7 @@ class Simulator:
     ) -> Dict[str, Any]:
         """
         Build a state snapshot.  Includes imbalance and resting volume
-        so users can study book dynamics and verify stationarity.
+        so users can study book dynamics; stationarity requires separate analysis.
         """
         return {
             "time":         t,

@@ -620,36 +620,9 @@ def simulation_loop():
             # Run one event
             current_t = sim_state['current_time']
 
-            # Generate next event
-            event = sim.event_generator.next_event(current_t)
-
-            # Process cancellations before this event
-            # (simplified: we'll just do one step)
+            event, order, trades = sim.advance(current_t)
             t = event.arrival_time
-
-            # Convert event to order
-            order = sim._event_to_order(event)
-
-            # Process order
             new_trade = None
-            if order.order_type == "limit":
-                trades, rested = sim.order_book.add_limit_order(order)
-                if rested:
-                    cancel_time = sim.event_generator.generate_cancel_time(t)
-                    sim._schedule_cancel(rested.order_id, cancel_time)
-            else:
-                trades = sim.order_book.process_market_order(order)
-                rested = None
-
-            # Update generator state
-            mid = sim.order_book.get_mid_price()
-            imbalance = sim.order_book.get_imbalance()
-            sim.event_generator.update_state(mid=mid, imbalance=imbalance)
-
-            # Build snapshot
-            snap = sim._build_snapshot(t, event.event_type.name, trades)
-            sim.history.snapshots.append(snap)
-            sim.history.trades.extend(trades)
 
             # Check for new trade
             if trades:

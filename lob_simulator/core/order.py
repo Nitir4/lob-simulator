@@ -21,6 +21,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 import itertools
+import math
+import numbers
 
 # Module-level counter so every Order ever created gets a unique ID, even
 # across multiple OrderBook instances in one process.
@@ -53,6 +55,21 @@ class Order:
     price: Optional[float]
     quantity: int
     timestamp: float
+
+    def validate(self) -> None:
+        if self.side not in {'buy', 'sell'} or self.order_type not in {'limit', 'market'}:
+            raise ValueError('Use a buy/sell limit or market order.')
+        if isinstance(self.order_id, bool) or not isinstance(self.order_id, numbers.Integral) or self.order_id < 1:
+            raise ValueError('Order IDs must be positive integers.')
+        if isinstance(self.quantity, bool) or not isinstance(self.quantity, numbers.Integral) or self.quantity < 1:
+            raise ValueError('Order quantity must be a positive integer.')
+        if not math.isfinite(self.timestamp) or self.timestamp < 0:
+            raise ValueError('Order timestamps must be finite and nonnegative.')
+        if self.order_type == 'limit':
+            if self.price is None or not math.isfinite(self.price) or self.price <= 0:
+                raise ValueError('Limit prices must be finite and positive.')
+        elif self.price is not None:
+            raise ValueError('Market orders must have no limit price.')
 
     # ------------------------------------------------------------------ #
     # Convenience constructors                                             #

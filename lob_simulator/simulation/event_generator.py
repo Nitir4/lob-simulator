@@ -1,63 +1,16 @@
-"""
-simulation/event_generator.py  (PHASE 2-3 REVISION)
-=====================================================
-Changes in this revision:
+"""Constant-rate arrival clock with state-dependent conditional event marks.
 
-PHASE 2 — Price Placement Fix
-------------------------------
-OLD (broken): offset ~ Geometric(p)-1 relative to best_bid/ask.
-  This CANNOT generate inside-spread orders. Limit buys can only be
-  placed AT or BELOW best_bid, never above it. As shown in Phase 1
-  critique, this means the event generator never tightens the spread.
-
-NEW (correct): delta ~ Exp(lambda_depth) relative to mid-price.
-  For limit buy:  price = mid - delta  (always below mid)
-  For limit sell: price = mid + delta  (always above mid)
-  delta > 0, so lim_buy < mid < lim_sell always.
-  But since mid = (bid + ask) / 2, an order placed at (mid - epsilon)
-  with epsilon < half_spread will be INSIDE the spread if:
-      epsilon < half_spread, i.e., price > bid.
-  P(inside spread) = P(delta < half_spread) = 1 - exp(-lambda × half_spread)
-  This is tunable via lambda_depth.
-
-WHY Exponential and not Geometric?
-  Geometric is a discrete approximation to the Exponential on a tick grid.
-  The Exponential is cleaner analytically and matches the Cont-Stoikov
-  (2010) model for limit order placement away from mid.
-  We round to nearest tick after sampling.
-
-PHASE 3 — State-Dependent Market Order Rates (Queue Imbalance)
---------------------------------------------------------------
-OLD (broken): event type probabilities are CONSTANTS — IID draws.
-  This produces zero expected price drift by symmetry.
-
-NEW (correct): market order rates are modulated by queue imbalance I.
-  Base probability vector: [p_lb, p_ls, p_mb, p_ms] (sum=1)
-  After observing imbalance I ∈ [-1, 1]:
-    p_mb' = p_mb * (1 + alpha * I)    market buys more likely when bid heavy
-    p_ms' = p_ms * (1 - alpha * I)    market sells more likely when ask heavy
-    p_lb, p_ls remain unchanged (limit orders less sensitive to imbalance)
-    Renormalize to sum=1.
-
-  WHY market orders more sensitive than limit orders?
-    Market orders express URGENT directionality — the trader believes they
-    must act NOW and is willing to pay the spread. This urgency is driven
-    by either private information or reaction to visible imbalance.
-    Limit orders are more patient; their placement IS affected by imbalance
-    but less so in a simple model.
-
-  ACADEMIC SOURCE: Cont & Larrard (2013) "How Order Flow Drives Price Changes"
-  The prediction P(price increase) = f(I) is the core result of this paper.
-  Our state-dependent rates implement the reduced-form intuition.
-
-PARAMETER CHANGES in SimParams:
-  - Removed: offset_geom_p (replaced by depth_lambda)
-  - Added: depth_lambda (Exponential price placement rate)
-  - Added: imbalance_alpha (sensitivity of market orders to imbalance)
+Market-order weights respond to best-level imbalance, then all weights are
+normalized. Effective type intensities equal arrival_rate times the normalized
+probabilities; passive intensities can change too. This is an illustrative
+marked Poisson model, not a calibrated reproduction of a published LOB model.
+Limit prices use mid-anchored exponential offsets and outward tick rounding.
 """
 
 from __future__ import annotations
 
+import math
+import numbers
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional
@@ -75,9 +28,8 @@ class SimParams:
     arrival_rate : λ_total — total order arrival rate (events per unit time).
     mu_cancel    : μ — cancellation rate per resting order.
                    Mean order lifetime = 1/mu_cancel time units.
-                   Stationarity requires: mu_cancel × mean_queue_depth ≈
-                   λ_limit × (1 - P_fill). Check that mean_queue_depth
-                   stabilizes in simulation output.
+                   Queue-depth behavior also depends on fills and arrivals.
+                   A short run or count threshold does not prove stationarity.
 
     Market microstructure
     ---------------------
@@ -103,12 +55,12 @@ class SimParams:
 
     State dependence
     ----------------
-    imbalance_alpha : Sensitivity of market order rates to queue imbalance I.
-                      alpha=0 → IID arrivals (no state dependence, no drift).
+    imbalance_alpha : Sensitivity of conditional market-order weights to imbalance I.
+                      alpha=0 → constant type probabilities; realized paths can drift.
                       alpha=1 → maximum sensitivity.
-                      alpha=0.5 → moderate, recommended for academic use.
-                      Increases realism but makes the model non-Markovian in
-                      the strict sense (rates depend on current book state).
+                      alpha=0.5 → illustrative moderate sensitivity, not calibrated.
+                      State-dependent rates remain Markovian in the complete
+                      order-book state.
 
     Order sizes
     -----------
@@ -134,12 +86,23 @@ class SimParams:
     max_size:           int   = 20
 
     def __post_init__(self) -> None:
-        total = (self.p0_limit_buy + self.p0_limit_sell
-                 + self.p0_market_buy + self.p0_market_sell)
-        assert abs(total - 1.0) < 1e-9, f"Base probs must sum to 1, got {total}"
-        assert self.mu_cancel > 0, "mu_cancel must be positive"
-        assert 0.0 <= self.imbalance_alpha <= 1.0, "alpha must be in [0,1]"
-        assert self.depth_lambda > 0, "depth_lambda must be positive"
+        positive = [self.arrival_rate, self.mu_cancel, self.tick_size, self.ref_price,
+                    self.initial_spread, self.depth_lambda]
+        if not all(math.isfinite(v) and v > 0 for v in positive):
+            raise ValueError('Rates, tick size, reference price, spread and depth must be finite and positive.')
+        probs = [self.p0_limit_buy, self.p0_limit_sell, self.p0_market_buy, self.p0_market_sell]
+        if not all(math.isfinite(v) and 0 <= v <= 1 for v in probs) or not math.isclose(sum(probs), 1., abs_tol=1e-9):
+            raise ValueError('Base probabilities must be nonnegative and sum to one.')
+        if not math.isfinite(self.imbalance_alpha) or not 0 <= self.imbalance_alpha < 1:
+            # At alpha=1 a one-sided market-only mix can have zero total intensity.
+            if self.imbalance_alpha != 1 or self.p0_limit_buy+self.p0_limit_sell == 0:
+                raise ValueError('Imbalance alpha must be in [0,1], with passive arrivals when alpha is one.')
+        if not math.isfinite(self.size_geom_p) or not 0 < self.size_geom_p <= 1:
+            raise ValueError('Geometric size probability must be in (0,1].')
+        if isinstance(self.max_size, bool) or not isinstance(self.max_size, numbers.Integral) or self.max_size < 1:
+            raise ValueError('Maximum size must be a positive integer.')
+        if self.ref_price-self.initial_spread/2-3*self.tick_size <= 0:
+            raise ValueError('Reference price must accommodate three positive warm-up bid levels.')
 
 
 class EventGenerator:
@@ -192,7 +155,11 @@ class EventGenerator:
         imbalance  : Current queue imbalance I ∈ [-1, 1].
         """
         if mid is not None:
+            if not math.isfinite(mid) or mid <= 0:
+                raise ValueError('Mid-price must be finite and positive.')
             self._mid = mid
+        if not math.isfinite(imbalance) or not -1 <= imbalance <= 1:
+            raise ValueError('Imbalance must be finite and in [-1,1].')
         self._imbalance = imbalance
 
     # ── backward-compat alias ────────────────────────────────────────
@@ -214,9 +181,16 @@ class EventGenerator:
         3. Price from Exp(depth_lambda) placement around midprice.
         4. Quantity from Geometric(size_geom_p).
         """
-        interarrival = self.rng.exponential(1.0 / self.params.arrival_rate)
-        arrival_time = current_time + interarrival
+        return self.event_at(self.next_arrival_time(current_time))
 
+    def next_arrival_time(self, current_time: float) -> float:
+        """Draw only the clock; state-dependent marks are drawn at arrival."""
+        if not math.isfinite(current_time) or current_time < 0:
+            raise ValueError('Current time must be finite and nonnegative.')
+        return current_time + self.rng.exponential(1.0 / self.params.arrival_rate)
+
+    def event_at(self, arrival_time: float) -> Event:
+        """Draw an arrival using the state after all preceding cancellations."""
         event_type = self._sample_event_type()
         price      = self._sample_price(event_type)
         quantity   = self._sample_quantity()
@@ -249,8 +223,8 @@ class EventGenerator:
           p_mb' = p_mb * (1 + alpha * I)
           p_ms' = p_ms * (1 - alpha * I)
 
-        Limit order probabilities are left unchanged (they respond
-        less to imbalance in this simplified model).
+        Raw limit-order weights are unchanged. Normalization can change
+        their final probabilities and hence their effective intensities.
 
         After adjustment, we renormalize to sum=1.
 
@@ -265,7 +239,7 @@ class EventGenerator:
         probs[2] *= (1.0 + alpha * I)
         probs[3] *= (1.0 - alpha * I)
 
-        # Clamp negatives from floating point arithmetic, then renormalize
+        # Renormalization also changes the final limit-order probabilities.
         probs = np.maximum(probs, 0.0)
         probs /= probs.sum()
 
@@ -276,8 +250,8 @@ class EventGenerator:
         """
         Midprice-anchored placement: delta ~ Exp(depth_lambda).
 
-        For limit buy:  price = mid - delta  (always below mid)
-        For limit sell: price = mid + delta  (always above mid)
+        For limit buy: raw price = mid - delta; round down to a positive tick
+        For limit sell: raw price = mid + delta; round up to a tick
 
         P(order is inside spread) = P(delta < half_spread)
                                   = 1 - exp(-depth_lambda * half_spread)
@@ -286,11 +260,9 @@ class EventGenerator:
           half_spread = 0.02
           P(inside spread) = 1 - exp(-50 * 0.02) = 1 - exp(-1) ≈ 0.63
 
-        This means ~63% of limit orders attempt to improve the quote,
-        of which roughly half cross and fill immediately, half tighten.
-        This is more aggressive than real markets (5-15% inside spread),
-        but produces visible spread dynamics. For a more conservative
-        calibration, use depth_lambda ≈ 10-20.
+        This is the continuous-price probability before outward tick rounding.
+        Passive orders remain on their side of the mid and do not deliberately
+        cross the opposite quote. No empirical inside-spread frequency is claimed.
 
         WHY place relative to MID and not best quote?
           If we place relative to best_bid (offset=0,1,2...):
@@ -299,7 +271,7 @@ class EventGenerator:
           If we place relative to MID:
             - Some buys land above best_bid (inside spread) → tighten.
             - Some buys land below best_bid (outside spread) → add depth.
-          This is the correct model (Cont-Stoikov 2010).
+          This is our mid-anchored placement assumption, not an exact paper reproduction.
         """
         p = self.params
         if event_type in (EventType.MARKET_BUY, EventType.MARKET_SELL):
@@ -312,8 +284,10 @@ class EventGenerator:
         else:
             raw = self._mid + delta
 
-        # Round to nearest tick
-        return round(raw / p.tick_size) * p.tick_size
+        # Round outward to the tick grid. A deep buy cannot quote a negative
+        # price; place it at the minimum positive tick instead.
+        ticks = math.floor(raw / p.tick_size) if event_type == EventType.LIMIT_BUY else math.ceil(raw / p.tick_size)
+        return max(1, ticks) * p.tick_size
 
     def _sample_quantity(self) -> int:
         p = self.params

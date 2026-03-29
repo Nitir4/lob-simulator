@@ -71,6 +71,7 @@ class OrderBook:
         self._asks: SortedDict = SortedDict()
         # order_id → Order: O(1) lookup for cancel
         self._order_index: Dict[int, Order] = {}
+        self._used_order_ids: set[int] = set()
 
     # ================================================================== #
     # Public interface                                                     #
@@ -94,8 +95,7 @@ class OrderBook:
           _order_index before/after — O(n). Returning the rested order
           directly makes this O(1).
         """
-        assert order.order_type == "limit", \
-            "Use process_market_order() for market orders."
+        self._validate_submission(order, "limit")
         trades = self._match(order)
 
         rested: Optional[Order] = None
@@ -110,7 +110,7 @@ class OrderBook:
         Submit a market order. Sweeps at best prices; remainder discarded.
         Market orders never rest in the book.
         """
-        assert order.order_type == "market"
+        self._validate_submission(order, "market")
         return self._match(order)
 
     def cancel_order(self, order_id: int) -> bool:
@@ -159,6 +159,8 @@ class OrderBook:
         'side' = 'buy' → best_bid level; 'sell' → best_ask level.
         Returns 0 if the side is empty.
         """
+        if side not in {"buy", "sell"}:
+            raise ValueError("Side must be buy or sell.")
         if side == "buy":
             if not self._bids:
                 return 0
@@ -184,7 +186,8 @@ class OrderBook:
           I < 0 → ask side heavier → downward price pressure.
           I = 0 → balanced, no directional signal.
 
-        Returns 0.0 when either side is empty (no signal possible).
+        Returns 0.0 when both sides are empty; a one-sided book has
+        imbalance +1 or -1.
 
         WHY use best level only, not total depth?
           Empirical research (Stoikov 2009, Cont-Larrard 2013) shows
@@ -243,12 +246,20 @@ class OrderBook:
             assert len(q) > 0, f"Empty bid level at {px}"
             for o in q:
                 assert o.quantity >= 1, f"Non-positive qty {o.quantity} in bids"
+                assert o.order_id not in book_ids, f"Duplicate resting ID {o.order_id}"
+                assert o.side == 'buy'
+                assert o.price == px, 'Order price differs from its level'
+                assert self._order_index.get(o.order_id) is o, 'Index points to another order'
                 book_ids.add(o.order_id)
 
         for px, q in self._asks.items():
             assert len(q) > 0, f"Empty ask level at {px}"
             for o in q:
                 assert o.quantity >= 1, f"Non-positive qty {o.quantity} in asks"
+                assert o.order_id not in book_ids, f"Duplicate resting ID {o.order_id}"
+                assert o.side == 'sell'
+                assert o.price == px, 'Order price differs from its level'
+                assert self._order_index.get(o.order_id) is o, 'Index points to another order'
                 book_ids.add(o.order_id)
 
         indexed_ids = set(self._order_index.keys())
@@ -260,6 +271,14 @@ class OrderBook:
     # ================================================================== #
     # Internal helpers                                                     #
     # ================================================================== #
+
+    def _validate_submission(self, order: Order, expected_type: str) -> None:
+        order.validate()
+        if order.order_type != expected_type:
+            raise ValueError(f'Expected a {expected_type} order.')
+        if order.order_id in self._used_order_ids:
+            raise ValueError('Order ID has already been used in this book.')
+        self._used_order_ids.add(order.order_id)
 
     def _add_to_book(self, order: Order) -> None:
         book = self._bids if order.side == "buy" else self._asks
